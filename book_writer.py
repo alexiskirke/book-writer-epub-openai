@@ -9,6 +9,9 @@ import html
 from abc import ABC, abstractmethod
 from gpt4all import GPT4All
 import sys
+from PIL import Image, ImageDraw, ImageFont
+import io
+import base64
 
 model_locations = "/Users/alexiskirke/Library/Application Support/nomic.ai/GPT4All/"
 models = {"nous":"nous-hermes-llama2-13b.Q4_0.gguf", "meta-128k":"Meta-Llama-3.1-8B-Instruct-128k-Q4_0.gguf","meta-instruct":"Meta-Llama-3-8B-Instruct.Q4_0.gguf"}
@@ -101,11 +104,16 @@ class OutlineHTMLGenerator:
         print(f"HTML outline saved to {output_file_path}")
 
 class OutlineEbookGenerator:
-    def __init__(self, json_file_path: str, book_title: str = 'Book Outline', book_author: str = 'Outline Generator'):
+    def __init__(self, json_file_path: str, book_title: str = 'Book Outline', book_author: str = 'Outline Generator', generate_cover: bool = False, force_kindle_compatibility: bool = False, override_image_prompt: str = ''):
         self.json_file_path = json_file_path
         self.outline_data = self._load_json()
         self.book_title = book_title
         self.book_author = book_author
+        self.generate_cover = generate_cover
+        self.force_kindle_compatibility = force_kindle_compatibility
+        self.override_image_prompt = override_image_prompt
+        if self.generate_cover:
+            self.openai_client = OpenAIClient()
 
     def _load_json(self) -> Dict:
         with open(self.json_file_path, 'r') as file:
@@ -121,11 +129,26 @@ class OutlineEbookGenerator:
         spine = ['nav']
         toc = []
 
-        # Create cover page
-        cover = epub.EpubHtml(title='Cover', file_name='cover.xhtml')
-        cover.content = f'<h1>{html.escape(self.book_title)}</h1>'
-        book.add_item(cover)
-        spine.append(cover)
+        # Create cover page if requested
+        if self.generate_cover:
+            cover_image = self._generate_cover_image()
+            book.set_cover("cover.jpg", cover_image)
+
+        # Create title page
+        title_page = epub.EpubHtml(title='Title Page', file_name='title.xhtml')
+        title_page.content = f'''
+            <html>
+            <head>
+                <title>{html.escape(self.book_title)}</title>
+            </head>
+            <body>
+                <h1 style="text-align: center;">{html.escape(self.book_title)}</h1>
+                <p style="text-align: center;">{html.escape(self.book_author)}</p>
+            </body>
+            </html>
+        '''
+        book.add_item(title_page)
+        spine.append(title_page)
 
         # Create table of contents
         toc_page = epub.EpubHtml(title='Table of Contents', file_name='toc.xhtml')
@@ -135,15 +158,15 @@ class OutlineEbookGenerator:
         for chapter_num, (chapter_title, chapter_content) in enumerate(self.outline_data.items(), 1):
             cleaned_chapter_title = chapter_title.strip().lstrip('-').replace('"', '')
             chapter = epub.EpubHtml(title=cleaned_chapter_title, file_name=f'chap_{chapter_num}.xhtml')
-            chapter.content = f'<h1>{html.escape(cleaned_chapter_title)}</h1>'
-            chapter.content += self._generate_section(chapter_content, 2)
+            chapter.content = f'<h1 id="{self._generate_id(cleaned_chapter_title)}">{html.escape(cleaned_chapter_title)}</h1>'
+            chapter.content += self._generate_section(chapter_content, 2, chapter_num)
             
             book.add_item(chapter)
             spine.append(chapter)
             toc.append(chapter)
 
             # Add chapter to table of contents
-            toc_content += f'<li><a href="chap_{chapter_num}.xhtml">{html.escape(cleaned_chapter_title)}</a>'
+            toc_content += f'<li><a href="chap_{chapter_num}.xhtml#{self._generate_id(cleaned_chapter_title)}">{html.escape(cleaned_chapter_title)}</a>'
             if isinstance(chapter_content, dict):
                 toc_content += self._generate_toc_section(chapter_content, chapter_num, 2)
             toc_content += '</li>'
@@ -151,27 +174,28 @@ class OutlineEbookGenerator:
         toc_content += '</ol></nav>'
         toc_page.content = toc_content
         book.add_item(toc_page)
-        spine.insert(1, toc_page)  # Insert TOC after cover, before chapters
+        spine.insert(2, toc_page)  # Insert TOC after cover and title page, before chapters
 
         book.spine = spine
         book.toc = toc
         book.add_item(epub.EpubNcx())
-        book.add_item(epub.EpubNav())
+        if self.force_kindle_compatibility:
+            book.add_item(epub.EpubNav())
 
         return book
 
-    def _generate_section(self, section: Dict, depth: int) -> str:
+    def _generate_section(self, section: Dict, depth: int, chapter_num: int) -> str:
         content = ""
         for title, subsections in section.items():
             cleaned_title = title.lstrip('-').replace('"', '')
             if depth <= 3:  # Only include h1, h2, and h3
-                content += f"<h{depth}>{html.escape(cleaned_title)}</h{depth}>"
+                content += f'<h{depth} id="{self._generate_id(cleaned_title)}">{html.escape(cleaned_title)}</h{depth}>'
             if isinstance(subsections, dict):
                 if "paragraphs" in subsections:
                     for paragraph in subsections["paragraphs"]:
                         content += self._process_paragraph(paragraph)
                 else:
-                    content += self._generate_section(subsections, depth + 1)
+                    content += self._generate_section(subsections, depth + 1, chapter_num)
             elif isinstance(subsections, str):
                 content += self._process_paragraph(subsections)
         return content
@@ -204,6 +228,66 @@ class OutlineEbookGenerator:
         
         # For now, we'll just wrap it in a math tag
         return f'<math xmlns="http://www.w3.org/1998/Math/MathML"><mtext>{html.escape(latex)}</mtext></math>'
+    
+    def _generate_cover_image(self) -> bytes:
+        if self.override_image_prompt:
+            prompt = self.override_image_prompt
+        else:
+            prompt = f"Create an image inspired by the words: '{self.book_title}'. The image should have a clear point of focus. It should be photorealistic."
+        try:
+            response = self.openai_client.client.images.generate(
+                model="dall-e-3",
+                prompt=prompt,
+                size="1024x1792",
+                quality="standard",
+                n=1,
+            )
+        except Exception as e:
+            msg = f"Error: _generate_cover_image - OpenAI API call failed: {str(e)}"
+            raise RuntimeError(msg) from e
+
+        image_url = response.data[0].url
+        
+        # Use requests to download the image
+        import requests
+        image_response = requests.get(image_url)
+        
+        # Save the image
+        image_path = f"{self.book_title}_cover_image.jpg"
+        with open(image_path, "wb") as f:
+            f.write(image_response.content)
+        
+        with open(image_path, "rb") as f:
+            image_data = f.read()
+
+            # Open the image using PIL
+            img = Image.open(io.BytesIO(image_data))
+        
+        # Create a drawing object
+        draw = ImageDraw.Draw(img)
+
+        # chop the image so it is ratio 1.5:1
+        width, height = img.size
+        target_ratio = 1/1.5
+        current_ratio = width / height
+
+        if current_ratio > target_ratio:
+            # Image is too wide, crop width
+            new_width = int(height * target_ratio)
+            left = (width - new_width) // 2
+            img = img.crop((left, 0, left + new_width, height))
+        elif current_ratio < target_ratio:
+            # Image is too tall, crop height
+            new_height = int(width / target_ratio)
+            top = (height - new_height) // 2
+            img = img.crop((0, top, width, top + new_height))
+
+        # Convert the image to RGB mode
+        img = img.convert('RGB')
+        
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format='JPEG')
+        return img_byte_arr.getvalue()
 
     def save_ebook(self, output_file_path: str):
         book = self.generate_ebook()
@@ -342,7 +426,7 @@ class BookOutlineGenerator:
                 self._count_total_sections_recursive(subcontent)
 
 # Usage example:
-title = 'Modern Artificial Intelligence - Post-2012 A.I.'
+title = 'How to become a Film Producer in the age of Indies, Netflix, YouTube and A.I.: A Step by Step Guide'
 
 #generator = BookOutlineGenerator(use_gpt4all=False)  # Set to False to use OpenAI
 paragraph_style = """Focus the writing 50 percent on actions that can be taken, and 50 percent on reflections on the deeper meaning of the topic. Write in a short snappy and modern style, but not too conversational. Write in shorter sentences, and avoid the passive voice, and adjectives and adverbs. Sound like a human, not a Large Language Model. Include examples occasionally. Include stories 
@@ -350,16 +434,16 @@ occasionally. If they are not true, say that they are illustrative. But
 you can include true stories as well.
 print("Starting book outline generation...")
 
-outline = generator.send_prompt(title, N0=10, N1=4, N2=2, N3=3, 
+outline = generator.send_prompt(title, N0=10, N1=4, N2=3, N3=3, 
                                 paragraph_style=paragraph_style)
 print("Book outline generation complete.")
 print(outline)
-
 """
+
 # Generate Ebook outline
 filename = 'outline_depth_3.json'
 filename = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'outline_steps', filename)
-
-ebook_generator = OutlineEbookGenerator(filename, book_title=title, book_author='Alexis Kirke')
-filename = title[:20] + '.epub'
+image_prompt = "Photo realistic. A female middle-aged producer on a movie set watching from behind the camera while a film crew is shooting a scene."
+ebook_generator = OutlineEbookGenerator(filename, book_title=title, book_author='Alexis Kirke', generate_cover=True, force_kindle_compatibility=True, override_image_prompt=image_prompt)
+filename = title[:30] + '.epub'
 ebook_generator.save_ebook(filename)
